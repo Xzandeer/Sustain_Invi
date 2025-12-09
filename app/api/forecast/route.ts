@@ -1,37 +1,43 @@
 import { NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-// Retry function to avoid Gemini model overload (503)
-async function callWithRetry(fn: () => Promise<any>, retries = 3) {
+// Retry function to avoid Gemini model overload (503) or quota errors (429)
+async function callWithRetry(fn: () => Promise<any>, retries = 3, delay = 3) {
   for (let i = 0; i < retries; i++) {
     try {
       return await fn();
     } catch (err: any) {
-      if (i === retries - 1) throw err;
-      await new Promise((res) => setTimeout(res, 500));
+      if (err.message.includes("Quota exceeded") || err.message.includes("Too Many Requests")) {
+        if (i < retries - 1) {
+          console.log(`Quota exceeded. Retrying in ${delay} seconds...`);
+          await new Promise((res) => setTimeout(res, delay * 1000));
+          delay *= 2; // Exponentially increase the delay for the next retry
+        } else {
+          throw new Error("API quota exceeded, retries failed.");
+        }
+      } else {
+        throw err; // Rethrow other errors (like 503 service unavailable)
+      }
     }
   }
 }
 
+// API POST handler
 export async function POST(req: Request) {
   try {
     const body = await req.json();
     const { sales, categorySales } = body;
 
     if (!process.env.GEMINI_API_KEY) {
-      return NextResponse.json(
-        { error: "Gemini API key missing." },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: "Gemini API key missing." }, { status: 500 });
     }
 
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
     // ✔ Use a STABLE model!
-const model = genAI.getGenerativeModel({
-  model: "gemini-2.5-flash",
-});
-
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash",
+    });
 
     const prompt = `
 You are an expert AI specializing in demand forecasting for retail surplus shops.
@@ -42,12 +48,6 @@ ${JSON.stringify(sales)}
 
 - CATEGORY SALES DATA (format: { category: [list of daily amounts] }):
 ${JSON.stringify(categorySales)}
-
-You are an expert AI specializing in retail demand forecasting.
-
-DATA:
-- TOTAL DAILY SALES: ${JSON.stringify(sales)}
-- CATEGORY SALES ({ category: [daily amounts] }): ${JSON.stringify(categorySales)}
 
 TASKS:
 1. Forecast the next 7 days of total sales.
@@ -69,7 +69,7 @@ Return **VALID JSON ONLY** in this exact format:
     // GEMINI CALL WITH RETRY
     const result = await callWithRetry(
       () => model.generateContent(prompt),
-      3
+      3 // Retries, you can adjust this number
     );
 
     let raw = result.response.text().trim();
@@ -90,12 +90,8 @@ Return **VALID JSON ONLY** in this exact format:
     }
 
     return NextResponse.json(json, { status: 200 });
-
   } catch (e: any) {
     console.error("Forecast API error:", e);
-    return NextResponse.json(
-      { error: "AI Forecasting failed", details: e.message },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "AI Forecasting failed", details: e.message }, { status: 500 });
   }
 }
